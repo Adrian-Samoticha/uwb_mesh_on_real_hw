@@ -1,0 +1,1414 @@
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+#[cfg(not(any(feature = "board-l431", feature = "board-bu03")))]
+compile_error!("select exactly one board feature: `board-l431` or `board-bu03`");
+#[cfg(all(feature = "board-l431", feature = "board-bu03"))]
+compile_error!("`board-l431` and `board-bu03` are mutually exclusive");
+
+#[cfg(not(feature = "sleep-experiment"))]
+use alloc::sync::Arc;
+
+use defmt::*;
+use defmt_rtt as _;
+use dw3000_ng::hl::SendTime;
+#[cfg(feature = "sleep-experiment")]
+use dw3000_ng::time::Duration as DwDuration;
+use dw3000_ng::time::Instant as DwInstant;
+use dw3000_ng::{self, Config as DwConfig, DW3000, Ready, Sending, SingleBufferReceiving};
+use embassy_executor::Spawner;
+use embassy_stm32::dma;
+use embassy_stm32::gpio::{Level, Output, Pin, Speed};
+use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::mode::Async;
+use embassy_stm32::peripherals::SPI1;
+use embassy_stm32::spi::{self, Spi};
+use embassy_stm32::time::Hertz;
+use embassy_stm32::wdg::IndependentWatchdog;
+use embassy_stm32::{Config, Peri, Peripherals, bind_interrupts, peripherals};
+use embassy_time::{Duration, Timer};
+use embedded_alloc::LlffHeap as Heap;
+use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
+use panic_probe as _;
+use smoltcp::wire::{
+    Ieee802154Address, Ieee802154Frame, Ieee802154FrameType, Ieee802154FrameVersion, Ieee802154Pan,
+    Ieee802154Repr,
+};
+#[cfg(not(feature = "sleep-experiment"))]
+use spin::Mutex;
+
+mod device;
+mod interfaces;
+mod prng;
+
+#[cfg(not(feature = "sleep-experiment"))]
+use device::Device;
+#[cfg(not(feature = "sleep-experiment"))]
+use interfaces::hardware_interface::{HardwareInterface, IncomingMessage, UwbAddress};
+#[cfg(not(feature = "sleep-experiment"))]
+use interfaces::hardware_interface_real_impl::RealHardwareInterface;
+
+bind_interrupts!(struct Irqs {
+    DMA1_CHANNEL2 => dma::InterruptHandler<peripherals::DMA1_CH2>;
+    DMA1_CHANNEL3 => dma::InterruptHandler<peripherals::DMA1_CH3>;
+});
+
+// ---------------------------------------------------------------------------
+// Global allocator
+// ---------------------------------------------------------------------------
+
+// The mesh's core routing/OGM-age tables are fixed-capacity arrays (see
+// `device::array_map::ArrayMap`) and don't need the heap; this only has to
+// cover `Arc`/`spin::Mutex` bookkeeping plus `Vec<u8>`/`String` message
+// buffers in `device::{mesh,firmware}`. Starting sizes below are a
+// conservative guess, not derived from a real budget analysis - tune if
+// allocation failures show up in practice.
+#[global_allocator]
+static HEAP: Heap = Heap::empty();
+
+#[cfg(feature = "board-l431")]
+const HEAP_SIZE: usize = 8192;
+#[cfg(feature = "board-bu03")]
+const HEAP_SIZE: usize = 2048;
+
+// ---------------------------------------------------------------------------
+// Crash diagnostics
+// ---------------------------------------------------------------------------
+
+/// Intercept every hard fault (including the `udf` that `panic_probe` triggers
+/// after printing a panic message). Logs the faulting PC/LR so we can see where
+/// the device died, lets the host drain the RTT buffer, then resets instead of
+/// hanging silently.
+#[cortex_m_rt::exception]
+unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
+    error!(
+        "HardFault: pc={=u32:x} lr={=u32:x} xpsr={=u32:x}",
+        frame.pc(),
+        frame.lr(),
+        frame.xpsr()
+    );
+    defmt::flush();
+    // ~14 ms @ 72 MHz: give probe-rs/J-Link time to read the RTT buffer out
+    // before we reset (if the IWDG fires during this delay, that reset works
+    // just as well).
+    cortex_m::asm::delay(1_000_000);
+    cortex_m::peripheral::SCB::sys_reset();
+}
+
+// ---------------------------------------------------------------------------
+// Roles and addressing (sleep-experiment only)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sleep-experiment")]
+#[derive(Clone, Copy, PartialEq)]
+enum Role {
+    /// Sends requests, measures distance, runs the reliability experiment.
+    Initiator,
+    /// Always listens and replies to requests with a timestamped response.
+    #[allow(dead_code)]
+    Responder,
+}
+
+/// Set to `Role::Responder` on the second board, `Role::Initiator` elsewhere.
+#[cfg(all(feature = "sleep-experiment", feature = "role-responder"))]
+const ROLE: Role = Role::Responder;
+#[cfg(all(feature = "sleep-experiment", not(feature = "role-responder")))]
+const ROLE: Role = Role::Initiator;
+
+/// PAN ID used by both boards.
+const PAN_ID: u16 = 0x0001;
+/// Short address of the initiator board.
+#[allow(dead_code)]
+const MY_ADDRESS: [u8; 2] = [0xAA, 0x01];
+/// Short address of the responder board (what the initiator sends to).
+#[allow(dead_code)]
+const DEST_ADDRESS: [u8; 2] = [0xAA, 0x02];
+/// 802.15.4 broadcast short address (0xFFFF).
+#[cfg(feature = "sleep-experiment")]
+const BROADCAST_ADDRESS: [u8; 2] = [0xFF, 0xFF];
+
+// ---------------------------------------------------------------------------
+// Ranging protocol (sleep-experiment only)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sleep-experiment")]
+const FRAME_TYPE_REQ: u8 = 0x01;
+#[cfg(feature = "sleep-experiment")]
+const FRAME_TYPE_RESP: u8 = 0x02;
+
+/// Responder turnaround in DW3000 ticks (1 tick = 1/(128 * 499.2 MHz)).
+/// Must be a multiple of 512 (delayed-TX requirement) and long enough for the
+/// TX power-up. Must also leave the responder enough wall-clock time after the
+/// request is received to program the delayed TX over SPI; 300 us (512 * 37440)
+/// was too short and triggered `DelayedSendTooLate`, so we use 2 ms.
+#[cfg(feature = "sleep-experiment")]
+const RESPONDER_TURNAROUND_TICKS: u64 = 512 * 249_600;
+
+/// Convert a one-way flight time in DW3000 ticks to metres.
+#[cfg(feature = "sleep-experiment")]
+fn ticks_to_metres(ticks: u64) -> f32 {
+    ticks as f32 * 299_792_458.0 / (128.0 * 499_200_000.0)
+}
+
+// ---------------------------------------------------------------------------
+// Experiment parameters (sleep-experiment only)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sleep-experiment")]
+const MESSAGE_COUNT: u32 = 100;
+#[cfg(feature = "sleep-experiment")]
+const RETRY_VALUES: &[u32] = &[0, 1, 2, 3, 5, 10];
+#[cfg(feature = "sleep-experiment")]
+const MIN_RETRY_DELAY: Duration = Duration::from_millis(5);
+#[cfg(feature = "sleep-experiment")]
+const MAX_RETRY_DELAY: Duration = Duration::from_millis(10);
+#[cfg(feature = "sleep-experiment")]
+const INTER_MESSAGE_DELAY: Duration = Duration::from_millis(10);
+#[cfg(feature = "sleep-experiment")]
+const RX_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(feature = "sleep-experiment")]
+const RESPONDER_RX_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// IWDG watchdog timeout. Must comfortably exceed the longest gap between
+/// `pet()` calls: the initiator sleeps up to 1 s between pets, the responder
+/// iterates far faster. Short enough that a genuinely hung SPI transaction or
+/// stalled loop still auto-recovers in a few seconds.
+const WATCHDOG_TIMEOUT_US: u32 = 3_500_000;
+
+#[cfg(feature = "sleep-experiment")]
+struct Program {
+    dw: Option<DwReady>,
+    wdg: IndependentWatchdog<'static, peripherals::IWDG>,
+    rng: prng::Prng,
+    #[allow(dead_code)]
+    spawner: Spawner,
+    p: Peripherals,
+    is_uwb_module_awake: bool,
+}
+
+#[cfg(feature = "sleep-experiment")]
+impl Program {
+    fn new(
+        dw: DwReady,
+        wdg: IndependentWatchdog<'static, peripherals::IWDG>,
+        rng: prng::Prng,
+        spawner: Spawner,
+        p: Peripherals,
+    ) -> Self {
+        Self {
+            dw: Some(dw),
+            wdg,
+            rng,
+            spawner,
+            p,
+            is_uwb_module_awake: true,
+        }
+    }
+
+    async fn send_request_with_retries(
+        &mut self,
+        dst: Ieee802154Address,
+        message: &[u8],
+        max_retries: u32,
+    ) -> Result<SendResult, SendError> {
+        let dw = self
+            .dw
+            .take()
+            .expect("send_request_with_retries: dw not available");
+        let (dw, result) = send_request(
+            dw,
+            dst,
+            message,
+            max_retries,
+            MIN_RETRY_DELAY,
+            MAX_RETRY_DELAY,
+            &mut self.rng,
+            &mut self.wdg,
+        )
+        .await;
+        self.dw = Some(dw);
+        result
+    }
+
+    async fn run_initiator(&mut self) {
+        info!("Initiator running");
+        let mut cycle: u32 = 0;
+
+        loop {
+            cycle = cycle.wrapping_add(1);
+            self.wdg.pet();
+            info!(
+                "Initiator cycle #{}: sending request to {:04x}:{:012x}",
+                cycle, PAN_ID, DEST_ADDRESS
+            );
+            let result = self
+                .send_request_with_retries(
+                    Ieee802154Address::Short(DEST_ADDRESS),
+                    b"Hello, world!",
+                    100,
+                )
+                .await;
+
+            if let Ok(res) = result {
+                info!(
+                    "Request: retries_needed={} distance_m={}",
+                    res.retries_needed, res.distance_m
+                );
+            } else {
+                warn!("Request failed: all retries exhausted");
+            }
+
+            // Sleep until next cycle, petting the watchdog every 1 s so the
+            // IWDG does not trip during the long inter-measurement gap.
+            for _ in 0..5 {
+                self.wdg.pet();
+                Timer::after(Duration::from_millis(1000)).await;
+            }
+        }
+    }
+
+    /// Reply to a ranging request using a delayed (time-scheduled) transmission so
+    /// the turnaround time `treply` is known exactly and can be embedded in the
+    /// response payload before sending.
+    async fn send_response(
+        &mut self,
+        dst: Ieee802154Address,
+        seq: u8,
+        t_rx_req: DwInstant,
+        cfg: DwConfig,
+    ) -> DwInstant {
+        let Ieee802154Address::Short(dst_short) = dst else {
+            return t_rx_req;
+        };
+
+        let base = DwInstant::new(t_rx_req.value() & !0x1FF).unwrap();
+        let turnaround = DwDuration::new(RESPONDER_TURNAROUND_TICKS).unwrap();
+        let t_tx_resp = base + turnaround;
+        let treply_ticks = t_tx_resp.value() - t_rx_req.value();
+
+        let mut tx_buf = [0u8; 64];
+        let frame = build_response_frame(&mut tx_buf, dst_short, seq, treply_ticks);
+
+        let dw = self.dw.take().expect("send_response: dw not available");
+        let mut sending = match dw
+            .send_frame(frame, SendTime::Delayed(t_tx_resp), cfg)
+            .await
+        {
+            Ok(dw) => dw,
+            Err(e) => {
+                error!(
+                    "send_response: send_frame failed: {}",
+                    defmt::Debug2Format(&e)
+                );
+                core::panic!("send_frame failed");
+            }
+        };
+        let t_tx = match wait_tx(&mut sending).await {
+            Ok(t) => t,
+            Err(e) => {
+                error!("send_response: s_wait failed: {}", defmt::Debug2Format(&e));
+                core::panic!("s_wait failed");
+            }
+        };
+        let dw = match sending.finish_sending().await {
+            Ok(dw) => dw,
+            Err(e) => {
+                error!(
+                    "send_response: finish_sending failed: {}",
+                    defmt::Debug2Format(&e)
+                );
+                core::panic!("finish_sending failed");
+            }
+        };
+        self.dw = Some(dw);
+        t_tx
+    }
+
+    async fn run_responder(&mut self) {
+        info!("Responder running");
+        let cfg = dw_rf_config();
+        let mut last_sleep_tick = embassy_time::Instant::now();
+        let mut sleep_tick_count = 0u64;
+
+        loop {
+            self.wdg.pet();
+            let dw = self.dw.take().expect("run_responder: dw not available");
+            let mut receiving = match dw.receive(cfg).await {
+                Ok(d) => d,
+                Err(e) => {
+                    error!("receive failed: {}", defmt::Debug2Format(&e));
+                    core::panic!("receive failed");
+                }
+            };
+            let rx = wait_rx(&mut receiving, RESPONDER_RX_TIMEOUT).await;
+            if let Err(RxFail::Driver(e)) = &rx {
+                warn!("responder rx driver error: {}", defmt::Debug2Format(e));
+            }
+            let mut dw = match receiving.finish_receiving().await {
+                Ok(d) => d,
+                Err(e) => {
+                    error!("finish_receiving failed: {}", defmt::Debug2Format(&e));
+                    core::panic!("finish_receiving failed");
+                }
+            };
+
+            while embassy_time::Instant::now() - last_sleep_tick >= Duration::from_millis(10) {
+                let wake_duration_in_steps = 10;
+                let sleep_duration_in_steps = 200;
+
+                let duty_duration = wake_duration_in_steps + sleep_duration_in_steps;
+                let time_in_cycle = sleep_tick_count % duty_duration;
+                if time_in_cycle == 0 {
+                    info!(
+                        "Responder: entering DEEPSLEEP for {} steps",
+                        sleep_duration_in_steps
+                    );
+                    dw_deep_sleep(&mut dw).await;
+                    self.is_uwb_module_awake = false;
+                } else if time_in_cycle == sleep_duration_in_steps {
+                    info!("Responder: waking up from DEEPSLEEP");
+                    drop(dw);
+                    dw = build_dw(&mut self.p, DEST_ADDRESS).await;
+                    self.is_uwb_module_awake = true;
+                }
+
+                sleep_tick_count += 1;
+                last_sleep_tick += Duration::from_millis(10);
+            }
+
+            if !self.is_uwb_module_awake {
+                self.dw = Some(dw);
+                continue;
+            }
+
+            if let Ok(rx) = rx {
+                let t_rx_req = rx.rx_time;
+                let frame = Ieee802154Frame::new_checked(&rx.buf[..rx.len]);
+                let (is_req, seq, src) = match &frame {
+                    Ok(f) => {
+                        let payload_ok = f
+                            .payload()
+                            .map_or(false, |p| !p.is_empty() && p[0] == FRAME_TYPE_REQ);
+                        match Ieee802154Repr::parse(f) {
+                            Ok(repr) => {
+                                let dst_ok = matches!(
+                                    repr.dst_addr,
+                                    Some(Ieee802154Address::Short(DEST_ADDRESS))
+                                        | Some(Ieee802154Address::Short(BROADCAST_ADDRESS))
+                                );
+                                (
+                                    dst_ok
+                                        && repr.src_addr.is_some()
+                                        && repr.sequence_number.is_some()
+                                        && payload_ok,
+                                    repr.sequence_number.unwrap_or(0),
+                                    repr.src_addr,
+                                )
+                            }
+                            Err(_) => (false, 0, None),
+                        }
+                    }
+                    Err(_) => (false, 0, None),
+                };
+
+                if is_req {
+                    self.dw = Some(dw);
+                    self.send_response(src.unwrap(), seq, t_rx_req, cfg).await;
+                } else {
+                    self.dw = Some(dw);
+                }
+            } else {
+                self.dw = Some(dw);
+            }
+        }
+    }
+
+    async fn run(&mut self) {
+        match ROLE {
+            Role::Initiator => self.run_initiator().await,
+            Role::Responder => self.run_responder().await,
+        }
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    unsafe {
+        embedded_alloc::init!(HEAP, HEAP_SIZE);
+    }
+
+    let mut config = Config::default();
+    board_rcc_config(&mut config);
+    let p = embassy_stm32::init(config);
+
+    Timer::after(Duration::from_millis(2000)).await;
+
+    info!("Hello World!");
+
+    // Diagnose why the previous boot ended: an IWDG reset flag set means the
+    // watchdog had to recover the device (a freeze/panic we did not catch).
+    {
+        use embassy_stm32::pac::RCC;
+        let csr = RCC.csr().read();
+        if csr.iwdgrstf() {
+            warn!("Reset cause: IWDG timeout (previous boot was reset by the watchdog)");
+            RCC.csr().modify(|w| w.set_rmvf(true));
+        } else if csr.sftrstf() {
+            warn!("Reset cause: software/system reset");
+        }
+    }
+
+    // Independent watchdog: if the firmware ever hangs (stuck SPI transaction,
+    // dead executor, unhandled fault), the device resets itself after
+    // WATCHDOG_TIMEOUT_US instead of freezing forever. Fed from the main loops.
+    let mut wdg =
+        unsafe { IndependentWatchdog::new(p.IWDG.clone_unchecked(), WATCHDOG_TIMEOUT_US) };
+    wdg.unleash();
+    info!(
+        "IWDG watchdog armed ({} ms timeout)",
+        WATCHDOG_TIMEOUT_US / 1000
+    );
+
+    #[cfg(feature = "sleep-experiment")]
+    {
+        info!(
+            "ROLE: {}",
+            match ROLE {
+                Role::Initiator => "initiator",
+                Role::Responder => "responder",
+            }
+        );
+        let mut dw3000 = build_dw(
+            &p,
+            match ROLE {
+                Role::Initiator => MY_ADDRESS,
+                Role::Responder => DEST_ADDRESS,
+            },
+        )
+        .await;
+        if let Ok((pan, addr)) = dw3000.get_address().await {
+            info!("DW3000 address: {:04x}:{:012x}", pan, addr);
+        }
+        let rng = prng::Prng::new(embassy_time::Instant::now().as_ticks() as u32);
+        let mut program = Program::new(dw3000, wdg, rng, spawner, p);
+        program.run().await;
+    }
+
+    #[cfg(not(feature = "sleep-experiment"))]
+    {
+        // Mesh mode: own short address selected by the `role-responder`
+        // feature so the two boards get distinct addresses out of the box.
+        let _ = &spawner;
+        #[cfg(feature = "role-responder")]
+        let short_address = DEST_ADDRESS;
+        #[cfg(not(feature = "role-responder"))]
+        let short_address = MY_ADDRESS;
+        info!(
+            "mesh node booting, short={:02x}:{:02x}",
+            short_address[0], short_address[1]
+        );
+        let dw = build_dw(&p, short_address).await;
+        run_mesh(p, dw, wdg, short_address).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mesh on real hardware
+//
+// The mesh (`device::Device`) is synchronous: `heartbeat()` expects a sync
+// `HardwareInterface`. The DW3000 driver is async and owned by this async
+// task, so `RealHardwareInterface` is a pure queue bridge (see its docs):
+// `send_message` enqueues, the pump below transmits; received frames are
+// decoded and pushed back for `get_incoming_message`.
+//
+// Sleep test: the responder build (`--features role-responder`) duty-cycles
+// the radio with true DW3000 DEEPSLEEP (2 s asleep / 300 ms awake, same
+// order of magnitude as the old sleep-experiment). The initiator build
+// repeats every unicast for longer than one sleep period, so at least one
+// copy lands in the responder's wake window.
+// ---------------------------------------------------------------------------
+
+/// Responder duty cycle: asleep this long between wake windows.
+#[cfg(all(not(feature = "sleep-experiment"), feature = "role-responder"))]
+const MESH_SLEEP_MS: u64 = 2000;
+/// Responder wake window: polls + heartbeats at full rate for this long.
+#[cfg(all(not(feature = "sleep-experiment"), feature = "role-responder"))]
+const MESH_WAKE_MS: u64 = 300;
+/// How long the receiver stays in RX per poll iteration.
+#[cfg(not(feature = "sleep-experiment"))]
+const MESH_RX_WINDOW: Duration = Duration::from_millis(8);
+/// OGM flood interval (both roles).
+#[cfg(not(feature = "sleep-experiment"))]
+const MESH_OGM_INTERVAL: Duration = Duration::from_secs(5);
+/// Initiator: delay before the first unicast burst (lets both boards boot
+/// and exchange a few OGMs first).
+#[cfg(all(not(feature = "sleep-experiment"), not(feature = "role-responder")))]
+const MESH_FIRST_BURST_DELAY: Duration = Duration::from_secs(4);
+/// Initiator: interval between unicast bursts.
+#[cfg(all(not(feature = "sleep-experiment"), not(feature = "role-responder")))]
+const MESH_BURST_INTERVAL: Duration = Duration::from_secs(15);
+/// Initiator: one unicast queued per step, for this many steps, so the burst
+/// spans longer than the responder's sleep period.
+#[cfg(all(not(feature = "sleep-experiment"), not(feature = "role-responder")))]
+const MESH_BURST_REPEATS: u32 = 150;
+/// Initiator: spacing between queued repeats.
+#[cfg(all(not(feature = "sleep-experiment"), not(feature = "role-responder")))]
+const MESH_BURST_STEP: Duration = Duration::from_millis(20);
+
+/// Canonical mesh address of the peer board (initiator build only, so the
+/// peer is always the responder).
+#[cfg(all(not(feature = "sleep-experiment"), not(feature = "role-responder")))]
+fn peer_address() -> UwbAddress {
+    UwbAddress::Extended([DEST_ADDRESS[0], DEST_ADDRESS[1], 0, 0, 0, 0, 0, 0])
+}
+
+/// Builds the queue-bridge `HardwareInterface`, creates a `Device` running
+/// the mesh on top of it, and drives everything: radio pumps, `heartbeat()`,
+/// periodic OGMs, and the role-specific sleep/burst behaviour.
+#[cfg(not(feature = "sleep-experiment"))]
+async fn run_mesh(
+    p: Peripherals,
+    mut dw: DwReady,
+    mut wdg: IndependentWatchdog<'static, peripherals::IWDG>,
+    short_address: [u8; 2],
+) -> ! {
+    #[cfg(not(feature = "role-responder"))]
+    let _ = &p;
+    let seed = embassy_time::Instant::now().as_ticks() as u32;
+    let hw: Arc<Mutex<dyn HardwareInterface>> =
+        Arc::new(Mutex::new(RealHardwareInterface::new(short_address, seed)));
+
+    let device_id = u16::from_be_bytes(short_address) as u64;
+    let device = Device::create(device_id);
+    device.init("mesh-node", "uwb-mesh-real-hw", hw.clone());
+
+    let mut tx_seq: u8 = 0;
+    let mut last_ogm = embassy_time::Instant::now();
+    device.send_ogm();
+
+    #[cfg(feature = "role-responder")]
+    info!("mesh responder running (duty-cycled RX)");
+    #[cfg(not(feature = "role-responder"))]
+    info!("mesh initiator running (repeating unicast)");
+
+    #[cfg(not(feature = "role-responder"))]
+    let mut next_burst = embassy_time::Instant::now() + MESH_FIRST_BURST_DELAY;
+    #[cfg(not(feature = "role-responder"))]
+    let mut burst_counter: u32 = 0;
+
+    loop {
+        #[cfg(feature = "role-responder")]
+        {
+            // --- Wake window: pump + heartbeat at full rate. ---
+            let wake_end = embassy_time::Instant::now() + Duration::from_millis(MESH_WAKE_MS);
+            while embassy_time::Instant::now() < wake_end {
+                wdg.pet();
+                let (d, n) = poll_rx_window(dw, hw.clone()).await;
+                dw = d;
+                if n > 0 {
+                    info!("mesh: {} frame(s) received", n);
+                }
+                device.heartbeat();
+                let (d, n) = drain_tx(dw, hw.clone(), &mut tx_seq).await;
+                dw = d;
+                if n > 0 {
+                    info!("mesh: {} frame(s) sent", n);
+                }
+                if embassy_time::Instant::now() - last_ogm >= MESH_OGM_INTERVAL {
+                    last_ogm = embassy_time::Instant::now();
+                    device.send_ogm();
+                }
+            }
+            // --- Sleep: true DW3000 DEEPSLEEP, then full re-init. ---
+            info!("mesh: entering DEEPSLEEP for {} ms", MESH_SLEEP_MS);
+            dw_deep_sleep(&mut dw).await;
+            let mut slept = 0u64;
+            while slept < MESH_SLEEP_MS {
+                wdg.pet();
+                let step = core::cmp::min(500, MESH_SLEEP_MS - slept);
+                Timer::after(Duration::from_millis(step)).await;
+                slept += step;
+            }
+            info!("mesh: waking up from DEEPSLEEP");
+            dw = build_dw(&p, short_address).await;
+            last_ogm = embassy_time::Instant::now();
+            device.send_ogm();
+        }
+
+        #[cfg(not(feature = "role-responder"))]
+        {
+            wdg.pet();
+            let (d, n) = poll_rx_window(dw, hw.clone()).await;
+            dw = d;
+            if n > 0 {
+                info!("mesh: {} frame(s) received", n);
+            }
+            device.heartbeat();
+            let (d, n) = drain_tx(dw, hw.clone(), &mut tx_seq).await;
+            dw = d;
+            if n > 0 {
+                info!("mesh: {} frame(s) sent", n);
+            }
+            if embassy_time::Instant::now() - last_ogm >= MESH_OGM_INTERVAL {
+                last_ogm = embassy_time::Instant::now();
+                device.send_ogm();
+            }
+            if embassy_time::Instant::now() >= next_burst {
+                burst_counter = burst_counter.wrapping_add(1);
+                next_burst = embassy_time::Instant::now() + MESH_BURST_INTERVAL;
+                info!("mesh: starting unicast burst #{}", burst_counter);
+                let payload = alloc::format!("hello {} from initiator", burst_counter);
+                for _ in 0..MESH_BURST_REPEATS {
+                    wdg.pet();
+                    device.send_unicast(peer_address(), payload.as_bytes().to_vec());
+                    device.heartbeat();
+                    let (d, _) = poll_rx_window_short(dw, hw.clone()).await;
+                    dw = d;
+                    let (d, _) = drain_tx(dw, hw.clone(), &mut tx_seq).await;
+                    dw = d;
+                    Timer::after(MESH_BURST_STEP).await;
+                }
+                info!("mesh: unicast burst #{} done", burst_counter);
+            }
+            Timer::after(Duration::from_millis(2)).await;
+        }
+    }
+}
+
+/// Listen for up to `MESH_RX_WINDOW`, decode every received 802.15.4 data
+/// frame, and push the payloads into the hardware interface RX queue.
+/// Returns the radio back plus the number of frames queued.
+///
+/// The DW3000 single-buffer receiver holds at most one frame per `receive()`
+/// session, so the session is re-armed after every frame (or error) until
+/// the window expires.
+#[cfg(not(feature = "sleep-experiment"))]
+async fn poll_rx_window(mut dw: DwReady, hw: Arc<Mutex<dyn HardwareInterface>>) -> (DwReady, u32) {
+    let cfg = dw_rf_config();
+    let deadline = embassy_time::Instant::now() + MESH_RX_WINDOW;
+    let mut buf = [0u8; 128];
+    let mut count = 0u32;
+    loop {
+        let mut receiving = match dw.receive(cfg).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("mesh rx: receive failed: {}", defmt::Debug2Format(&e));
+                core::panic!("mesh rx: receive failed");
+            }
+        };
+        // Poll this session until the first frame (or terminal error); then
+        // finish it and re-arm with a fresh session so no frame is missed.
+        let window_over = loop {
+            match receiving.r_wait(&mut buf).await {
+                Ok(msg) => {
+                    if let Some(incoming) = decode_mesh_frame(&msg) {
+                        hw.lock().push_incoming(incoming);
+                        count += 1;
+                    }
+                    break false;
+                }
+                Err(nb::Error::WouldBlock) => {
+                    if embassy_time::Instant::now() >= deadline {
+                        break true;
+                    }
+                    Timer::after_micros(100).await;
+                }
+                Err(nb::Error::Other(e)) => {
+                    if !is_retryable_rx_error(&e) {
+                        error!(
+                            "mesh rx: non-retryable radio error: {}",
+                            defmt::Debug2Format(&e)
+                        );
+                        core::panic!("mesh rx: unexpected radio error");
+                    }
+                    // Session spent; re-arm unless the window expired.
+                    break embassy_time::Instant::now() >= deadline;
+                }
+            }
+        };
+        dw = finish_receiving_or_panic(receiving).await;
+        if window_over || embassy_time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    (dw, count)
+}
+
+/// Finish an RX session, retrying once; panics (→ watchdog reset) if the
+/// radio is wedged, matching the sleep-experiment's fatal-error policy.
+#[cfg(not(feature = "sleep-experiment"))]
+async fn finish_receiving_or_panic(receiving: DwReceiving) -> DwReady {
+    match receiving.finish_receiving().await {
+        Ok(d) => d,
+        Err((r, e)) => {
+            error!(
+                "mesh rx: finish_receiving failed: {}",
+                defmt::Debug2Format(&e)
+            );
+            match r.finish_receiving().await {
+                Ok(d) => d,
+                Err(_) => core::panic!("mesh rx: finish_receiving failed twice"),
+            }
+        }
+    }
+}
+
+/// Short RX poll used inside the initiator burst loop (the surrounding loop
+/// already sets the ~20 ms cadence, so a full window would slow the burst).
+#[cfg(all(not(feature = "sleep-experiment"), not(feature = "role-responder")))]
+async fn poll_rx_window_short(
+    dw: DwReady,
+    hw: Arc<Mutex<dyn HardwareInterface>>,
+) -> (DwReady, u32) {
+    let cfg = dw_rf_config();
+    let mut receiving = match dw.receive(cfg).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("mesh rx: receive failed: {}", defmt::Debug2Format(&e));
+            core::panic!("mesh rx: receive failed");
+        }
+    };
+    let mut buf = [0u8; 128];
+    let mut count = 0u32;
+    for _ in 0..20 {
+        match receiving.r_wait(&mut buf).await {
+            Ok(msg) => {
+                if let Some(incoming) = decode_mesh_frame(&msg) {
+                    hw.lock().push_incoming(incoming);
+                    count += 1;
+                }
+                break;
+            }
+            Err(nb::Error::WouldBlock) => Timer::after_micros(100).await,
+            Err(nb::Error::Other(e)) => {
+                if !is_retryable_rx_error(&e) {
+                    error!(
+                        "mesh rx: non-retryable radio error: {}",
+                        defmt::Debug2Format(&e)
+                    );
+                    core::panic!("mesh rx: unexpected radio error");
+                }
+                break;
+            }
+        }
+    }
+    let dw = finish_receiving_or_panic(receiving).await;
+    (dw, count)
+}
+
+/// Decode one received 802.15.4 frame into a mesh `IncomingMessage`.
+/// Returns `None` for non-data frames or malformed packets.
+#[cfg(not(feature = "sleep-experiment"))]
+fn decode_mesh_frame(msg: &dw3000_ng::hl::Message<'_>) -> Option<IncomingMessage> {
+    let bytes = msg.frame.clone().into_inner();
+    let frame = Ieee802154Frame::new_checked(bytes).ok()?;
+    let repr = Ieee802154Repr::parse(&frame).ok()?;
+    let src = match repr.src_addr? {
+        Ieee802154Address::Short(s) => RealHardwareInterface::map_source(s),
+        Ieee802154Address::Extended(e) => UwbAddress::Extended(e),
+        Ieee802154Address::Absent => return None,
+    };
+    let payload = frame.payload().unwrap_or(&[]);
+    Some(IncomingMessage {
+        source: src,
+        data: payload.to_vec(),
+    })
+}
+
+/// Transmit every frame queued in the hardware interface. Returns the radio
+/// back plus the number of frames sent.
+#[cfg(not(feature = "sleep-experiment"))]
+async fn drain_tx(
+    mut dw: DwReady,
+    hw: Arc<Mutex<dyn HardwareInterface>>,
+    seq: &mut u8,
+) -> (DwReady, u32) {
+    let mut count = 0u32;
+    loop {
+        let next = hw.lock().take_outgoing();
+        let Some((destination, data)) = next else {
+            break;
+        };
+        let dst_short = RealHardwareInterface::map_destination(&destination);
+        dw = mesh_tx_once(dw, dst_short, *seq, &data).await;
+        *seq = seq.wrapping_add(1);
+        count += 1;
+    }
+    (dw, count)
+}
+
+/// Transmit one mesh payload as an 802.15.4 data frame.
+#[cfg(not(feature = "sleep-experiment"))]
+async fn mesh_tx_once(dw: DwReady, dst_short: [u8; 2], seq: u8, payload: &[u8]) -> DwReady {
+    let cfg = dw_rf_config();
+    let src_short = {
+        #[cfg(feature = "role-responder")]
+        let s = DEST_ADDRESS;
+        #[cfg(not(feature = "role-responder"))]
+        let s = MY_ADDRESS;
+        s
+    };
+    let repr = Ieee802154Repr {
+        frame_type: Ieee802154FrameType::Data,
+        security_enabled: false,
+        frame_pending: false,
+        ack_request: false,
+        sequence_number: Some(seq),
+        pan_id_compression: true,
+        frame_version: Ieee802154FrameVersion::Ieee802154_2006,
+        dst_pan_id: Some(Ieee802154Pan(PAN_ID)),
+        dst_addr: Some(Ieee802154Address::Short(dst_short)),
+        src_pan_id: None,
+        src_addr: Some(Ieee802154Address::Short(src_short)),
+    };
+    let header_len = repr.buffer_len();
+    let total = header_len + payload.len();
+    let mut buf = [0u8; 128];
+    let frame = {
+        let mut f = Ieee802154Frame::new_unchecked(&mut buf[..total]);
+        repr.emit(&mut f);
+        f.payload_mut()
+            .expect("mesh tx: no payload area")
+            .copy_from_slice(payload);
+        f
+    };
+    let mut sending = match dw.send_frame(frame, SendTime::Now, cfg).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("mesh tx: send_frame failed: {}", defmt::Debug2Format(&e));
+            core::panic!("mesh tx: send_frame failed");
+        }
+    };
+    if let Err(e) = wait_tx(&mut sending).await {
+        error!("mesh tx: s_wait failed: {}", defmt::Debug2Format(&e));
+        core::panic!("mesh tx: s_wait failed");
+    }
+    match sending.finish_sending().await {
+        Ok(d) => d,
+        Err((s, e)) => {
+            error!(
+                "mesh tx: finish_sending failed: {}",
+                defmt::Debug2Format(&e)
+            );
+            match s.finish_sending().await {
+                Ok(d) => d,
+                Err(_) => core::panic!("mesh tx: finish_sending failed twice"),
+            }
+        }
+    }
+}
+
+/// Clock tree for the STM32L431 board: HSI-derived 72 MHz sysclk via PLL1_R.
+#[cfg(feature = "board-l431")]
+fn board_rcc_config(config: &mut Config) {
+    use embassy_stm32::rcc::{Pll, PllMul, PllPreDiv, PllQDiv, PllRDiv, PllSource, Sysclk};
+
+    config.rcc.sys = Sysclk::PLL1_R;
+    config.rcc.hsi = true;
+    // Enable LSI so the IWDG watchdog can run.
+    config.rcc.ls.lsi = true;
+    config.rcc.pll = Some(Pll {
+        source: PllSource::HSI,
+        prediv: PllPreDiv::DIV1,
+        mul: PllMul::MUL18,
+        divp: None,
+        divq: Some(PllQDiv::DIV6), // 48Mhz (16 / 1 * 18 / 6)
+        divr: Some(PllRDiv::DIV4), // sysclk 72Mhz clock (16 / 1 * 18 / 4)
+    });
+}
+
+/// Clock tree for the Ai-Thinker BU03-Kit (STM32F103CBT6): 8 MHz HSE crystal
+/// (X1) driving a 72 MHz sysclk via PLL x9, standard "blue pill"-style config.
+#[cfg(feature = "board-bu03")]
+fn board_rcc_config(config: &mut Config) {
+    use embassy_stm32::rcc::{
+        AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllMul, PllPreDiv, PllSource, Sysclk,
+    };
+
+    config.rcc.hse = Some(Hse {
+        freq: Hertz(8_000_000),
+        mode: HseMode::Oscillator,
+    });
+    config.rcc.pll = Some(Pll {
+        src: PllSource::HSE,
+        prediv: PllPreDiv::DIV1,
+        mul: PllMul::MUL9, // sysclk 72Mhz clock (8 / 1 * 9)
+    });
+    config.rcc.sys = Sysclk::PLL1_P;
+    config.rcc.ahb_pre = AHBPrescaler::DIV1;
+    config.rcc.apb1_pre = APBPrescaler::DIV2;
+    config.rcc.apb2_pre = APBPrescaler::DIV1;
+}
+
+/// DW3000 RSTN is wired to PB2 on the STM32L431 board.
+#[cfg(feature = "board-l431")]
+fn reset_pin(p: &embassy_stm32::Peripherals) -> Peri<'static, impl Pin> {
+    unsafe { p.PB2.clone_unchecked() }
+}
+
+/// DW3000 RSTN is wired to PA0 (net "DW_RSTN") on the Ai-Thinker BU03-Kit,
+/// per the BU03-Kit schematic (STM32F103CBT6 U1, pin 10 / PA0-WKUP).
+#[cfg(feature = "board-bu03")]
+fn reset_pin(p: &embassy_stm32::Peripherals) -> Peri<'static, impl Pin> {
+    unsafe { p.PA0.clone_unchecked() }
+}
+
+/// Build (and initialize) a DW3000 by cloning the shared peripheral handles,
+/// configuring it with the given short address. Safe to call repeatedly for
+/// a full hardware reset + re-init cycle.
+async fn build_dw(p: &embassy_stm32::Peripherals, addr: [u8; 2]) -> DwReady {
+    unsafe {
+        init_dw3000(
+            p.SPI1.clone_unchecked(),
+            p.PA5.clone_unchecked(),
+            p.PA7.clone_unchecked(),
+            p.PA6.clone_unchecked(),
+            p.DMA1_CH3.clone_unchecked(),
+            p.DMA1_CH2.clone_unchecked(),
+            p.PA4.clone_unchecked(),
+            reset_pin(p),
+            addr,
+        )
+        .await
+    }
+}
+
+type DwBus<'d> = ExclusiveDevice<Spi<'d, Async, spi::mode::Master>, Output<'d>, NoDelay>;
+type DwError = dw3000_ng::Error<DwBus<'static>>;
+type DwReady = DW3000<DwBus<'static>, Ready>;
+type DwSending = DW3000<DwBus<'static>, Sending>;
+type DwReceiving = DW3000<DwBus<'static>, SingleBufferReceiving>;
+
+async fn init_dw3000<'d, D1, D2>(
+    spi1: Peri<'d, SPI1>,
+    sck: Peri<'d, peripherals::PA5>,
+    mosi: Peri<'d, peripherals::PA7>,
+    miso: Peri<'d, peripherals::PA6>,
+    tx_dma: Peri<'d, D1>,
+    rx_dma: Peri<'d, D2>,
+    cs: Peri<'d, impl Pin>,
+    reset: Peri<'d, impl Pin>,
+    addr: [u8; 2],
+) -> DW3000<DwBus<'d>, Ready>
+where
+    D1: spi::TxDma<SPI1>,
+    D2: spi::RxDma<SPI1>,
+    Irqs: Binding<<D1 as embassy_stm32::dma::ChannelInstance>::Interrupt, dma::InterruptHandler<D1>>
+        + Binding<<D2 as embassy_stm32::dma::ChannelInstance>::Interrupt, dma::InterruptHandler<D2>>,
+{
+    info!("init_dw3000: resetting DW3000 via PB2");
+    {
+        let rst = Output::new(reset, Level::Low, Speed::Low);
+        info!("init_dw3000: reset pin driven low, busy-waiting ~5ms");
+        cortex_m::asm::delay(360_000); // ~5ms @ 72MHz, diagnostic only
+        info!("init_dw3000: busy-wait done, releasing reset");
+        drop(rst);
+    }
+    info!("init_dw3000: waiting 1ms after release");
+    Timer::after(Duration::from_millis(1)).await;
+    info!("init_dw3000: 1ms elapsed");
+
+    info!("init_dw3000: configuring SPI1 (PA5=SCK, PA6=MISO, PA7=MOSI, mode 0, 18 MHz)");
+    let mut cfg = spi::Config::default();
+    cfg.mode = spi::MODE_0;
+    cfg.frequency = Hertz(18_000_000);
+    let spi = Spi::new(spi1, sck, mosi, miso, tx_dma, rx_dma, Irqs, cfg);
+    info!("init_dw3000: SPI1 ready, chip select on CS pin");
+
+    let cs = Output::new(cs, Level::High, Speed::VeryHigh);
+    let dev = ExclusiveDevice::new_no_delay(spi, cs);
+
+    let dw = DW3000::new(dev);
+    info!("init_dw3000: calling dw3000.init()");
+    let dw = match dw.init().await {
+        Ok(dw) => dw,
+        Err(e) => {
+            error!("dw3000 init failed: {}", defmt::Debug2Format(&e));
+            core::panic!("dw3000 init failed");
+        }
+    };
+    info!("init_dw3000: calling dw3000.config()");
+    let mut dw = match dw.config(DwConfig::default(), AsyncDelay).await {
+        Ok(dw) => dw,
+        Err(e) => {
+            error!("dw3000 config failed: {}", defmt::Debug2Format(&e));
+            core::panic!("dw3000 config failed");
+        }
+    };
+
+    let mut dw = match dw
+        .set_address(Ieee802154Pan(PAN_ID), Ieee802154Address::Short(addr))
+        .await
+    {
+        Ok(()) => dw,
+        Err(e) => {
+            error!("set_address failed: {}", defmt::Debug2Format(&e));
+            core::panic!("set_address failed");
+        }
+    };
+    let dw = match dw.set_antenna_delay(0, 0).await {
+        Ok(()) => dw,
+        Err(e) => {
+            error!("set_antenna_delay failed: {}", defmt::Debug2Format(&e));
+            core::panic!("set_antenna_delay failed");
+        }
+    };
+
+    info!("init_dw3000: DW3000 initialized successfully");
+    dw
+}
+
+/// Enter DW3000 true DEEPSLEEP (all clocks off, ~260 nA).
+/// Used by the sleep-experiment responder and by the mesh responder's duty
+/// cycle (wake-up is a full hardware reset + re-init via `build_dw`).
+#[allow(dead_code)]
+async fn dw_deep_sleep(dw: &mut DwReady) {
+    if let Err(e) = dw
+        .ll()
+        .aon_cfg()
+        .write(|w| {
+            w.sleep_en(1)
+                .wake_cnt(0)
+                .wake_csn(0)
+                .wake_wup(0)
+                .pres_sleep(0)
+        })
+        .await
+    {
+        warn!(
+            "dw_deep_sleep: aon_cfg write failed: {}",
+            defmt::Debug2Format(&e)
+        );
+    }
+    if let Err(e) = dw.ll().aon_dig_cfg().write(|w| w.onw_aon_dld(1)).await {
+        warn!(
+            "dw_deep_sleep: aon_dig_cfg write failed: {}",
+            defmt::Debug2Format(&e)
+        );
+    }
+    if let Err(e) = dw.ll().aon_ctrl().write(|w| w).await {
+        warn!(
+            "dw_deep_sleep: aon_ctrl write failed: {}",
+            defmt::Debug2Format(&e)
+        );
+    }
+    if let Err(e) = dw.ll().aon_ctrl().write(|w| w.save(1)).await {
+        warn!(
+            "dw_deep_sleep: aon_ctrl save write failed: {}",
+            defmt::Debug2Format(&e)
+        );
+    }
+    info!("dw: DEEPSLEEP issued");
+}
+
+struct AsyncDelay;
+
+impl embedded_hal_async::delay::DelayNs for AsyncDelay {
+    async fn delay_ns(&mut self, ns: u32) {
+        Timer::after(Duration::from_nanos(ns as u64)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Frame helpers
+// ---------------------------------------------------------------------------
+
+/// RF config for all TX/RX: default channel 5, PRF 64 MHz, preamble 128,
+/// 850 kbps, with the ranging bit set.
+fn dw_rf_config() -> DwConfig {
+    DwConfig {
+        ranging_enable: true,
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "sleep-experiment")]
+fn build_request_frame<'a>(
+    buf: &'a mut [u8],
+    dst: Ieee802154Address,
+    seq: u8,
+    message: &[u8],
+) -> Ieee802154Frame<&'a mut [u8]> {
+    let repr = Ieee802154Repr {
+        frame_type: Ieee802154FrameType::Data,
+        security_enabled: false,
+        frame_pending: false,
+        ack_request: false,
+        sequence_number: Some(seq),
+        pan_id_compression: true,
+        frame_version: Ieee802154FrameVersion::Ieee802154_2006,
+        dst_pan_id: Some(Ieee802154Pan(PAN_ID)),
+        dst_addr: Some(dst),
+        src_pan_id: None,
+        src_addr: Some(Ieee802154Address::Short(MY_ADDRESS)),
+    };
+    let header_len = repr.buffer_len();
+    let total = header_len + 1 + message.len();
+    {
+        let mut frame = Ieee802154Frame::new_unchecked(&mut buf[..total]);
+        repr.emit(&mut frame);
+        let payload = frame.payload_mut().unwrap();
+        payload[0] = FRAME_TYPE_REQ;
+        payload[1..1 + message.len()].copy_from_slice(message);
+    }
+    Ieee802154Frame::new_unchecked(&mut buf[..total])
+}
+
+#[cfg(feature = "sleep-experiment")]
+fn build_response_frame<'a>(
+    buf: &'a mut [u8],
+    dst: [u8; 2],
+    seq: u8,
+    treply_ticks: u64,
+) -> Ieee802154Frame<&'a mut [u8]> {
+    let repr = Ieee802154Repr {
+        frame_type: Ieee802154FrameType::Data,
+        security_enabled: false,
+        frame_pending: false,
+        ack_request: false,
+        sequence_number: Some(seq),
+        pan_id_compression: true,
+        frame_version: Ieee802154FrameVersion::Ieee802154_2006,
+        dst_pan_id: Some(Ieee802154Pan(PAN_ID)),
+        dst_addr: Some(Ieee802154Address::Short(dst)),
+        src_pan_id: None,
+        src_addr: Some(Ieee802154Address::Short(DEST_ADDRESS)),
+    };
+    let header_len = repr.buffer_len();
+    let total = header_len + 6;
+    {
+        let mut frame = Ieee802154Frame::new_unchecked(&mut buf[..total]);
+        repr.emit(&mut frame);
+        let payload = frame.payload_mut().unwrap();
+        payload[0] = FRAME_TYPE_RESP;
+        payload[1..6].copy_from_slice(&treply_ticks.to_be_bytes()[3..8]);
+    }
+    Ieee802154Frame::new_unchecked(&mut buf[..total])
+}
+
+// ---------------------------------------------------------------------------
+// TX/RX waits
+//
+// `wait_tx` is shared between the sleep-experiment ranging protocol and the
+// mesh radio pump (`poll_rx_window` / `mesh_tx_once` below).
+// ---------------------------------------------------------------------------
+
+async fn wait_tx(dw: &mut DwSending) -> Result<DwInstant, DwError> {
+    loop {
+        match dw.s_wait().await {
+            Ok(ts) => return Ok(ts),
+            Err(nb::Error::WouldBlock) => Timer::after_micros(20).await,
+            Err(nb::Error::Other(e)) => return Err(e),
+        }
+    }
+}
+
+#[cfg(feature = "sleep-experiment")]
+enum RxFail {
+    Timeout,
+    Driver(DwError),
+}
+
+/// A received frame copied out of the driver's receive buffer, so it no longer
+/// borrows anything.
+#[cfg(feature = "sleep-experiment")]
+struct RxFrame {
+    rx_time: DwInstant,
+    buf: [u8; 128],
+    len: usize,
+}
+
+#[cfg(feature = "sleep-experiment")]
+async fn wait_rx(dw: &mut DwReceiving, timeout: Duration) -> Result<RxFrame, RxFail> {
+    let deadline = embassy_time::Instant::now() + timeout;
+    let mut buffer = [0u8; 128];
+    loop {
+        match dw.r_wait(&mut buffer).await {
+            Ok(msg) => {
+                let mut out = RxFrame {
+                    rx_time: msg.rx_time,
+                    buf: [0u8; 128],
+                    len: 0,
+                };
+                let bytes = msg.frame.into_inner();
+                out.len = bytes.len().min(out.buf.len());
+                out.buf[..out.len].copy_from_slice(&bytes[..out.len]);
+                return Ok(out);
+            }
+            Err(nb::Error::WouldBlock) => {
+                if embassy_time::Instant::now() >= deadline {
+                    return Err(RxFail::Timeout);
+                }
+                Timer::after_micros(50).await;
+            }
+            Err(nb::Error::Other(e)) => return Err(RxFail::Driver(e)),
+        }
+    }
+}
+
+/// RF-level failures we can simply retry; anything else is a fatal radio error.
+fn is_retryable_rx_error(e: &DwError) -> bool {
+    matches!(
+        e,
+        DwError::FrameWaitTimeout
+            | DwError::PreambleDetectionTimeout
+            | DwError::SfdTimeout
+            | DwError::Phy
+            | DwError::ReedSolomon
+            | DwError::Overrun
+            | DwError::FrameFilteringRejection
+            | DwError::Fcs
+            | DwError::Frame(_)
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Reliability experiment (sleep-experiment only)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sleep-experiment")]
+struct SendResult {
+    retries_needed: u32,
+    distance_m: f32,
+}
+
+#[cfg(feature = "sleep-experiment")]
+enum SendError {
+    MaxRetriesExceeded,
+}
+
+/// Random delay in `[min, max]`.
+#[cfg(feature = "sleep-experiment")]
+async fn random_delay(min: Duration, max: Duration, rng: &mut prng::Prng) -> Duration {
+    let range = max.as_micros().saturating_sub(min.as_micros());
+    let r = rng.next_u32();
+    min + Duration::from_micros(r as u64 % (range + 1))
+}
+
+/// Send one request to `dst` (a short address or the broadcast address) with up
+/// to `max_retries` retries and random backoff.
+///
+/// The responder always replies from `DEST_ADDRESS`; for a broadcast request
+/// that unicast reply is what lets us measure the broadcast drop rate.
+///
+/// Returns the DW3000 (back in `Ready`) together with the result. On failure
+/// the `Err` contains only the failure reason; a `SendError` only occurs after
+/// exhausting all retries, so dropped messages still hand the radio back.
+///
+/// Note: any SPI-level error is treated as fatal and panics; it leaves the
+/// DW3000 in an unknown state.
+#[cfg(feature = "sleep-experiment")]
+async fn send_request(
+    mut dw: DwReady,
+    dst: Ieee802154Address,
+    message: &[u8],
+    max_retries: u32,
+    min_delay: Duration,
+    max_delay: Duration,
+    rng: &mut prng::Prng,
+    wdg: &mut IndependentWatchdog<'static, peripherals::IWDG>,
+) -> (DwReady, Result<SendResult, SendError>) {
+    let cfg = dw_rf_config();
+    let mut seq: u8 = 0;
+
+    for attempt in 0..=max_retries {
+        wdg.pet();
+        if attempt > 0 {
+            let d = random_delay(min_delay, max_delay, rng).await;
+            Timer::after(d).await;
+        }
+
+        // 1. Send the request and timestamp its transmission.
+        let mut tx_buf = [0u8; 64];
+        let frame = build_request_frame(&mut tx_buf, dst, seq, message);
+        let mut sending = match dw.send_frame(frame, SendTime::Now, cfg).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("send_frame failed: {}", defmt::Debug2Format(&e));
+                core::panic!("send_frame failed");
+            }
+        };
+        let t_tx = match wait_tx(&mut sending).await {
+            Ok(t) => t,
+            Err(e) => {
+                error!("s_wait failed: {}", defmt::Debug2Format(&e));
+                core::panic!("s_wait failed");
+            }
+        };
+        let ready = match sending.finish_sending().await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("finish_sending failed: {}", defmt::Debug2Format(&e));
+                core::panic!("finish_sending failed");
+            }
+        };
+
+        // 2. Listen for the response.
+        let mut receiving = match ready.receive(cfg).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("receive failed: {}", defmt::Debug2Format(&e));
+                core::panic!("receive failed");
+            }
+        };
+        let rx = wait_rx(&mut receiving, RX_TIMEOUT).await;
+        dw = match receiving.finish_receiving().await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("finish_receiving failed: {}", defmt::Debug2Format(&e));
+                core::panic!("finish_receiving failed");
+            }
+        };
+
+        if let Err(RxFail::Driver(e)) = &rx {
+            if !is_retryable_rx_error(e) {
+                error!(
+                    "unexpected (non-retryable) radio error: {}",
+                    defmt::Debug2Format(e)
+                );
+                core::panic!("unexpected radio error in rx");
+            }
+        }
+
+        'retry: {
+            let Ok(rx) = rx else {
+                break 'retry;
+            };
+            let t_rx = rx.rx_time;
+            let frame = match Ieee802154Frame::new_checked(&rx.buf[..rx.len]) {
+                Ok(f) => f,
+                Err(_) => break 'retry,
+            };
+            let repr = match Ieee802154Repr::parse(&frame) {
+                Ok(r) => r,
+                Err(_) => break 'retry,
+            };
+            if repr.sequence_number != Some(seq)
+                || repr.src_addr != Some(Ieee802154Address::Short(DEST_ADDRESS))
+            {
+                break 'retry;
+            }
+            let payload = frame.payload().unwrap_or(&[]);
+            if payload.len() < 6 || payload[0] != FRAME_TYPE_RESP {
+                break 'retry;
+            }
+            let treply = u64::from_be_bytes([
+                0, 0, 0, payload[1], payload[2], payload[3], payload[4], payload[5],
+            ]);
+            let round_trip = t_rx.duration_since(t_tx).value();
+            let tof_ticks = round_trip.saturating_sub(treply) / 2;
+            return (
+                dw,
+                Ok(SendResult {
+                    retries_needed: attempt,
+                    distance_m: ticks_to_metres(tof_ticks),
+                }),
+            );
+        }
+        seq = seq.wrapping_add(1);
+    }
+
+    (dw, Err(SendError::MaxRetriesExceeded))
+}

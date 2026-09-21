@@ -1,0 +1,30 @@
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+# The chip differs per `board-*` feature (see Cargo.toml / src/main.rs), which
+# `runner` here can't see directly. probe-rs-runner.sh reads the chip name
+# that build.rs records for the currently-built feature and flashes that.
+#   cargo run --release                                                                             # board-l431 (default), STM32L431CC (Cortex-M4)
+#   cargo run --release --target thumbv7m-none-eabi --no-default-features --features board-bu03      # board-bu03, STM32F103CB (Cortex-M3)
+runner = "bash probe-rs-runner.sh"
+
+[build]
+# Default target is Cortex-M4 (STM32L431). STM32F103 (board-bu03) is
+# Cortex-M3, which does NOT support the DSP instructions thumbv7em code can
+# generate — running a thumbv7em binary on it hits an undefined-instruction
+# fault (silent hang, no fault handler installed) the first time such an
+# instruction executes. board-bu03 builds MUST pass `--target thumbv7m-none-eabi`.
+target = "thumbv7em-none-eabi"
+
+[env]
+DEFMT_LOG = "trace"
+
+[target.thumbv7em-none-eabi]
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tdefmt.x",
+]
+
+[target.thumbv7m-none-eabi]
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tdefmt.x",
+]
