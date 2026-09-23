@@ -313,41 +313,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dw3000_sleep_experiment"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "cortex-m",
- "cortex-m-rt",
- "defmt 1.1.1",
- "defmt-rtt",
- "dw3000-ng",
- "embassy-embedded-hal",
- "embassy-executor",
- "embassy-futures",
- "embassy-net",
- "embassy-net-adin1110",
- "embassy-stm32",
- "embassy-sync",
- "embassy-time",
- "embassy-usb",
- "embedded-alloc",
- "embedded-hal 0.2.7",
- "embedded-hal 1.0.0",
- "embedded-hal-async",
- "embedded-hal-bus",
- "embedded-io 0.7.1",
- "embedded-io-async 0.7.0",
- "heapless 0.9.3",
- "micromath",
- "nb 1.1.0",
- "panic-probe",
- "smoltcp",
- "spin",
- "static_cell",
-]
-
-[[package]]
 name = "embassy-embedded-hal"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1469,6 +1434,41 @@ dependencies = [
  "serde",
  "syn 3.0.3",
  "usbd-hid-descriptors",
+]
+
+[[package]]
+name = "uwb_mesh"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 1.1.1",
+ "defmt-rtt",
+ "dw3000-ng",
+ "embassy-embedded-hal",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-net-adin1110",
+ "embassy-stm32",
+ "embassy-sync",
+ "embassy-time",
+ "embassy-usb",
+ "embedded-alloc",
+ "embedded-hal 0.2.7",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "embedded-hal-bus",
+ "embedded-io 0.7.1",
+ "embedded-io-async 0.7.0",
+ "heapless 0.9.3",
+ "micromath",
+ "nb 1.1.0",
+ "panic-probe",
+ "smoltcp",
+ "spin",
+ "static_cell",
 ]
 
 [[package]]

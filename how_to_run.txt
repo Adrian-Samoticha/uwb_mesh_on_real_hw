@@ -1,13 +1,11 @@
-Mesh mode (default; initiator unless role-responder is given):
-
-For uni-dev board (STM32L431):
+Sender (default role) on uni-dev board (STM32L431):
 cargo run --release
-or (responder, duty-cycled RX with DW3000 DEEPSLEEP):
-cargo run --release --features role-responder
+
+Base-station on uni-dev board (STM32L431):
+cargo run --release --features base-station
+
+Explicit sender role (same as default):
+cargo run --release --features sender
 
 For BU03 (doesn't really work):
-cargo run --release --target thumbv7m-none-eabi --no-default-features --features board-bu03,role-responder
-
-Legacy sleep-experiment ranging protocol instead of the mesh:
-cargo run --release --features sleep-experiment
-cargo run --release --features sleep-experiment,role-responder
+cargo run --release --target thumbv7m-none-eabi --no-default-features --features board-bu03,base-station

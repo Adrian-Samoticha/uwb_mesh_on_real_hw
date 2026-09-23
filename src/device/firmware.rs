@@ -62,6 +62,14 @@ impl Firmware {
         self.mesh.send_unicast(destination, data);
     }
 
+    /// Snapshot of the mesh routing table (destination -> next hop).
+    pub fn get_routing_table(
+        &self,
+    ) -> crate::device::ArrayMap<hardware_interface::UwbAddress, hardware_interface::UwbAddress, 4>
+    {
+        self.mesh.get_routing_table()
+    }
+
     fn handle_serial_input(&mut self) {
         let chars: Vec<char> = {
             if let Some(hi) = &self.hardware_interface {

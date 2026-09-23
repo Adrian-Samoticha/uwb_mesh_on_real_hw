@@ -11,6 +11,8 @@ mod array_map;
 mod firmware;
 mod mesh;
 
+pub use array_map::ArrayMap;
+
 pub struct Device {
     id: Id,
     middleware: Mutex<Option<firmware::Firmware>>,
@@ -71,6 +73,21 @@ impl Device {
         if let Some(middleware) = self.middleware.lock().as_mut() {
             middleware.send_unicast(destination, data);
         }
+    }
+
+    /// Snapshot of the mesh routing table (destination -> next hop).
+    /// Empty until `init` has installed the firmware.
+    pub fn get_routing_table(
+        &self,
+    ) -> ArrayMap<hardware_interface::UwbAddress, hardware_interface::UwbAddress, 4> {
+        self.middleware
+            .lock()
+            .as_ref()
+            .map(|middleware| middleware.get_routing_table())
+            .unwrap_or(ArrayMap::new(
+                [None; 4],
+                [hardware_interface::UwbAddress::Short(0); 4],
+            ))
     }
 
     pub fn get_heartbeats_left(&self) -> i32 {

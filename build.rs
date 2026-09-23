@@ -22,8 +22,15 @@ fn main() {
     let target_dir = env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| manifest_dir.join("target"));
-    fs::create_dir_all(&target_dir).expect("failed to create target dir");
-    fs::write(target_dir.join("probe-rs-chip.txt"), chip).expect("failed to write probe-rs-chip.txt");
+    // Record the chip per target triple, not in one shared file: cargo caches
+    // build-script outputs per (target, features) unit, so a single shared
+    // file goes stale when switching boards (e.g. L431 binary flashed with
+    // the F103 chip left over from a BU03 build). `probe-rs-runner.sh`
+    // derives the triple from the binary path it is given.
+    let triple = env::var("TARGET").expect("TARGET not set");
+    let triple_dir = target_dir.join(&triple);
+    fs::create_dir_all(&triple_dir).expect("failed to create target triple dir");
+    fs::write(triple_dir.join("probe-rs-chip.txt"), chip).expect("failed to write probe-rs-chip.txt");
 
     println!("cargo:rustc-link-search={}", out_dir.display());
     println!("cargo:rerun-if-changed=memory-l431.x");

@@ -1,5 +1,5 @@
 [package]
-name = "dw3000_sleep_experiment"
+name = "uwb_mesh"
 version = "0.1.0"
 edition = "2024"
 
@@ -12,8 +12,11 @@ default = ["board-l431"]
 # board-bu03 pins the driver to TIM2 explicitly instead.
 board-l431 = ["embassy-stm32/stm32l431cc", "embassy-stm32/time-driver-any"]
 board-bu03 = ["embassy-stm32/stm32f103cb", "embassy-stm32/time-driver-tim2"]
-role-responder = []
-sleep-experiment = []
+# Node role: exactly one of these should be selected. `sender` is the default
+# (a plain build behaves as a sender); `base-station` switches to the
+# base-station behavior. Setting both is a compile error (see src/main.rs).
+base-station = []
+sender = []
 
 [dependencies]
 # Chip and time driver are selected via the `board-*` features above; do not add them here.
@@ -86,7 +89,7 @@ build = [
 ]
 
 [[bin]]
-name = "stm32l4_hello_world_embassy"
+name = "uwb_mesh"
 path = "src/main.rs"
 test = false
 doctest = false
