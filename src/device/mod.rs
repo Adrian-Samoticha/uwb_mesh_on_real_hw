@@ -84,6 +84,15 @@ impl Device {
         }
     }
 
+    /// Drain one addressed-to-me unicast payload (source, data) received by
+    /// the mesh. `None` until such a payload arrives (or `init` hasn't run).
+    pub fn take_received_data(&self) -> Option<(hardware_interface::UwbAddress, alloc::vec::Vec<u8>)> {
+        self.middleware
+            .lock()
+            .as_mut()
+            .and_then(|middleware| middleware.take_received_data())
+    }
+
     /// Snapshot of the mesh routing table (destination -> next hop).
     /// Empty until `init` has installed the firmware.
     pub fn get_routing_table(

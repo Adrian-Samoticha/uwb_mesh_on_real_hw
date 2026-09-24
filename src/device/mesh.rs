@@ -200,6 +200,12 @@ pub struct Mesh {
     /// Maps received OGM messages to their age in milliseconds. This is used to determine when to discard old OGMs.
     received_ogm_to_age_in_ms: [(UwbAddressAndSequenceNumber, u32); 4],
 
+    /// Addressed-to-me unicast payloads, delivered from the radio during
+    /// `heartbeat()` and drained by the application with
+    /// `take_received_data()`. The mesh only transports these payloads; the
+    /// application owns any acknowledgement/retransmission protocol.
+    received_data: Vec<(hardware_interface::UwbAddress, Vec<u8>)>,
+
     /// The routing table, which maps destination addresses to the next hop address.
     routing_table: ArrayMap<hardware_interface::UwbAddress, hardware_interface::UwbAddress, 4>,
 }
@@ -226,6 +232,7 @@ impl Mesh {
                 },
                 0,
             ); 4],
+            received_data: Vec::new(),
             routing_table: ArrayMap::new([None; 4], [hardware_interface::UwbAddress::Short(0); 4]),
         }
     }
@@ -490,11 +497,16 @@ impl Mesh {
                         };
 
                         if is_addressed_to_me {
-                            let hi = self.hardware_interface.as_ref().unwrap().lock();
-                            hi.printf(format_args!(
-                                "Received unicast message from {}: {:?}\n",
-                                source, data
-                            ));
+                            {
+                                let hi = self.hardware_interface.as_ref().unwrap().lock();
+                                hi.printf(format_args!(
+                                    "Received unicast message from {}: {:?}\n",
+                                    source, data
+                                ));
+                            }
+                            // Hand the payload to the application layer, which
+                            // owns any acknowledgement logic.
+                            self.received_data.push((source, data));
                         } else {
                             let next_hop = self.routing_table.get(&destination);
                             if let Some(next_hop) = next_hop {
@@ -683,6 +695,15 @@ impl Mesh {
         &self,
     ) -> ArrayMap<hardware_interface::UwbAddress, hardware_interface::UwbAddress, 4> {
         self.routing_table
+    }
+
+    /// Drains one addressed-to-me unicast payload delivered by the mesh, if
+    /// any. The application owns the acknowledgement/retransmission logic.
+    pub fn take_received_data(&mut self) -> Option<(hardware_interface::UwbAddress, Vec<u8>)> {
+        if self.received_data.is_empty() {
+            return None;
+        }
+        Some(self.received_data.remove(0))
     }
 
     /// Sends a unicast message to the specified destination with the given data.

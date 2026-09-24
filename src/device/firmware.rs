@@ -68,6 +68,12 @@ impl Firmware {
         self.mesh.send_unicast(destination, data);
     }
 
+    /// Drain one addressed-to-me unicast payload (source, data) received by
+    /// the mesh; application-level acknowledgement logic lives elsewhere.
+    pub fn take_received_data(&mut self) -> Option<(hardware_interface::UwbAddress, Vec<u8>)> {
+        self.mesh.take_received_data()
+    }
+
     /// Snapshot of the mesh routing table (destination -> next hop).
     pub fn get_routing_table(
         &self,
