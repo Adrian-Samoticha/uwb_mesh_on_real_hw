@@ -68,6 +68,15 @@ impl Device {
         }
     }
 
+    /// Queue one copy of a single-OGM flood (one sequence number); the main
+    /// loop calls this once per flood step with the step `index`. No-op
+    /// until `init` has installed the firmware.
+    pub fn send_ogm_burst(&self, index: u32, repeats: u32) {
+        if let Some(middleware) = self.middleware.lock().as_mut() {
+            middleware.send_ogm_burst(index, repeats);
+        }
+    }
+
     /// Queue a unicast frame. No-op until `init` has installed the firmware.
     pub fn send_unicast(&self, destination: hardware_interface::UwbAddress, data: alloc::vec::Vec<u8>) {
         if let Some(middleware) = self.middleware.lock().as_mut() {

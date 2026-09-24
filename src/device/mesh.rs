@@ -609,6 +609,45 @@ impl Mesh {
         self.next_ogm_sequence_number = self.next_ogm_sequence_number.wrapping_add(1);
     }
 
+    /// Queues one copy of a *single* OGM (one originator + sequence number)
+    /// as part of a flood. The main loop calls this once per burst step with
+    /// the step `index`; all copies share the same sequence number and it
+    /// only advances after the last copy (`index + 1 == repeats`).
+    ///
+    /// Intended for duty-cycled neighbours: a flood spans `repeats * step`
+    /// in time (the main loop paces the steps), so a node that only listens
+    /// for part of its wake window still catches at least one copy — while
+    /// seeing exactly one distinct OGM for deduplication and routing.
+    /// Queuing one copy per call (as the sender ping burst does) keeps heap
+    /// usage bounded.
+    pub fn send_ogm_burst(&mut self, index: u32, repeats: u32) {
+        let message = Message::Ogm {
+            source: self
+                .hardware_interface
+                .as_ref()
+                .unwrap()
+                .lock()
+                .get_uwb_address(),
+            sequence_number: self.next_ogm_sequence_number,
+        };
+        let data = message.to_data();
+        let mut hi = self.hardware_interface.as_ref().unwrap().lock();
+        let time_until_send_in_ms = hi.generate_random_integer() % 2 * 10;
+
+        let broadcast_address =
+            hardware_interface::UwbAddress::new(0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff);
+        self.outgoing_message_handler.add_message(OutgoingMessage {
+            destination: broadcast_address,
+            data,
+            time_to_send_in_ms: time_until_send_in_ms as i32,
+        });
+        drop(hi);
+
+        if index + 1 == repeats {
+            self.next_ogm_sequence_number = self.next_ogm_sequence_number.wrapping_add(1);
+        }
+    }
+
     /// Forwards an OGM (Originator Message) to the specified destination, preserving the source and sequence number.
     fn forward_ogm(
         &mut self,

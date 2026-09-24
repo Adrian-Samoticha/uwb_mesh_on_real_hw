@@ -8,7 +8,9 @@ compile_error!("select exactly one board feature: `board-l431` or `board-bu03`")
 #[cfg(all(feature = "board-l431", feature = "board-bu03"))]
 compile_error!("`board-l431` and `board-bu03` are mutually exclusive");
 #[cfg(all(feature = "base-station", feature = "sender"))]
-compile_error!("`base-station` and `sender` are mutually exclusive; pick at most one (`sender` is the default)");
+compile_error!(
+    "`base-station` and `sender` are mutually exclusive; pick at most one (`sender` is the default)"
+);
 
 use alloc::sync::Arc;
 
@@ -197,17 +199,16 @@ const MESH_WAKE_MS: u64 = 300;
 const MESH_RX_WINDOW: Duration = Duration::from_millis(8);
 /// Base-station: OGM broadcast interval.
 #[cfg(feature = "base-station")]
-const BASE_STATION_OGM_INTERVAL: Duration = Duration::from_secs(60);
+const BASE_STATION_OGM_INTERVAL: Duration = Duration::from_secs(10);
 /// Sender: ping interval.
 #[cfg(not(feature = "base-station"))]
 const SENDER_PING_INTERVAL: Duration = Duration::from_secs(10);
-/// Sender: repeats per ping burst. One repeat is queued per step (see
-/// `MESH_BURST_STEP`), so the burst spans longer than the base-station's
-/// sleep period and at least one copy lands in its wake window.
-#[cfg(not(feature = "base-station"))]
+/// Repeats per flood/burst, shared by both roles: the base-station OGM flood
+/// and the sender ping burst. One copy is queued per step (see
+/// `MESH_BURST_STEP`), so the burst spans longer than every other node's
+/// sleep period and at least one copy lands in each wake window.
 const MESH_BURST_REPEATS: u32 = 150;
-/// Sender: spacing between burst repeats.
-#[cfg(not(feature = "base-station"))]
+/// Spacing between burst repeats.
 const MESH_BURST_STEP: Duration = Duration::from_millis(20);
 
 /// Builds the queue-bridge `HardwareInterface`, creates a `Device` running
@@ -241,13 +242,13 @@ async fn run_mesh(
 
     #[cfg(feature = "base-station")]
     {
-        info!("mesh base-station running (OGM every 60 s)");
+        info!("mesh base-station running");
         // Advertise immediately so senders learn the route without waiting
-        // a full minute after boot.
-        device.send_ogm();
+        // a full flood interval (10 s) after boot.
+        dw = ogm_flood(&device, dw, hw.clone(), short_address, &mut tx_seq, &mut wdg).await;
     }
     #[cfg(not(feature = "base-station"))]
-    info!("mesh sender running (ping every 10 s)");
+    info!("mesh sender running");
 
     loop {
         // --- Wake window: pump + heartbeat at full rate. ---
@@ -269,8 +270,7 @@ async fn run_mesh(
             #[cfg(feature = "base-station")]
             if embassy_time::Instant::now() - last_ogm >= BASE_STATION_OGM_INTERVAL {
                 last_ogm = embassy_time::Instant::now();
-                device.send_ogm();
-                info!("base-station: OGM broadcast queued");
+                dw = ogm_flood(&device, dw, hw.clone(), short_address, &mut tx_seq, &mut wdg).await;
             }
 
             #[cfg(not(feature = "base-station"))]
@@ -336,6 +336,35 @@ async fn run_mesh(
         drop(dw);
         dw = build_dw(&p, short_address).await;
     }
+}
+
+/// Base-station: flood one OGM (single sequence number, `MESH_BURST_REPEATS`
+/// copies, one queued per `MESH_BURST_STEP`) so the flood spans longer than
+/// a neighbouring node's 2 s DEEPSLEEP period — a waking (but otherwise
+/// phase-locked) node always catches a copy and learns the route to us.
+/// Stays awake (no sleep) for the whole flood; returns the radio back.
+#[cfg(feature = "base-station")]
+async fn ogm_flood(
+    device: &Device,
+    mut dw: DwReady,
+    hw: Arc<Mutex<dyn HardwareInterface>>,
+    short_address: [u8; 2],
+    tx_seq: &mut u8,
+    wdg: &mut IndependentWatchdog<'static, peripherals::IWDG>,
+) -> DwReady {
+    info!("base-station: OGM flood starting");
+    for i in 0..MESH_BURST_REPEATS {
+        wdg.pet();
+        device.send_ogm_burst(i, MESH_BURST_REPEATS);
+        device.heartbeat();
+        let (d, _) = poll_rx_window_short(dw, hw.clone()).await;
+        dw = d;
+        let (d, _) = drain_tx(dw, hw.clone(), short_address, tx_seq).await;
+        dw = d;
+        Timer::after(MESH_BURST_STEP).await;
+    }
+    info!("base-station: OGM flood done");
+    dw
 }
 
 /// Listen for up to `MESH_RX_WINDOW`, decode every received 802.15.4 data
@@ -414,9 +443,8 @@ async fn finish_receiving_or_panic(receiving: DwReceiving) -> DwReady {
     }
 }
 
-/// Short RX poll used inside the sender burst loop (the surrounding loop
-/// already sets the ~20 ms cadence, so a full window would slow the burst).
-#[cfg(not(feature = "base-station"))]
+/// Short RX poll used inside burst loops (the surrounding loop already
+/// sets the ~20 ms cadence, so a full window would slow the burst).
 async fn poll_rx_window_short(
     dw: DwReady,
     hw: Arc<Mutex<dyn HardwareInterface>>,
@@ -460,8 +488,15 @@ async fn poll_rx_window_short(
 /// Decode one received 802.15.4 frame into a mesh `IncomingMessage`.
 /// Returns `None` for non-data frames or malformed packets.
 fn decode_mesh_frame(msg: &dw3000_ng::hl::Message<'_>) -> Option<IncomingMessage> {
-    let bytes = msg.frame.clone().into_inner();
-    let frame = Ieee802154Frame::new_checked(bytes).ok()?;
+    let mut bytes = msg.frame.clone().into_inner().to_vec();
+    // The DW3000 reports rxflen including the 2-byte FCS, so the trailing
+    // two bytes are the frame check sequence, not application data. Strip
+    // them before the mesh parses the payload.
+    if bytes.len() < 2 {
+        return None;
+    }
+    bytes.truncate(bytes.len() - 2);
+    let frame = Ieee802154Frame::new_checked(&bytes[..]).ok()?;
     let repr = Ieee802154Repr::parse(&frame).ok()?;
     let src = match repr.src_addr? {
         Ieee802154Address::Short(s) => RealHardwareInterface::map_source(s),
