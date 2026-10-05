@@ -200,13 +200,6 @@ const BASE_STATION_OGM_INTERVAL: Duration = Duration::from_secs(10);
 /// Sender: ping interval.
 #[cfg(not(feature = "base-station"))]
 const SENDER_PING_INTERVAL: Duration = Duration::from_secs(10);
-/// Repeats per flood/burst, shared by both roles: the base-station OGM flood
-/// and the sender ping burst. One copy is queued per step (see
-/// `MESH_BURST_STEP`), so the burst spans longer than every other node's
-/// sleep period and at least one copy lands in each wake window.
-const MESH_BURST_REPEATS: u32 = 150;
-/// Spacing between burst repeats.
-const MESH_BURST_STEP: Duration = Duration::from_millis(20);
 
 /// Application-layer ping/ack protocol, carried as opaque unicast payloads
 /// *through* the mesh (the mesh itself doesn't know about it). Payload:
@@ -215,7 +208,7 @@ const MESH_BURST_STEP: Duration = Duration::from_millis(20);
 /// The counter identifies the ping, so the sender only stops retransmitting
 /// once the destination acknowledges that specific ping.
 const APP_MSG_PING: u8 = 0x01;
-const APP_MSG_ACK: u8 = 0x02;
+// const APP_MSG_ACK: u8 = 0x02; // TODO: remove this
 
 /// Decodes an application-layer message into its (type, counter), or `None`
 /// if the payload isn't a well-formed 5-byte app message.
@@ -225,21 +218,6 @@ fn decode_app_message(data: &[u8]) -> Option<(u8, u32)> {
     } else {
         None
     }
-}
-
-/// Sender: drain every delivered payload and report whether an
-/// acknowledgement for `ping_counter` arrived from `destination`.
-#[cfg(not(feature = "base-station"))]
-fn sender_ack_received(device: &Device, destination: UwbAddress, ping_counter: u32) -> bool {
-    let mut acked = false;
-    while let Some((from, data)) = device.take_received_data() {
-        if let Some((msg_type, counter)) = decode_app_message(&data) {
-            if msg_type == APP_MSG_ACK && counter == ping_counter && from == destination {
-                acked = true;
-            }
-        }
-    }
-    acked
 }
 
 /// Base-station: drain every addressed-to-me payload the mesh delivered and
@@ -264,11 +242,6 @@ fn app_base_tick(device: &Device, pending_ack: &mut Option<(u32, UwbAddress)>) {
                 *pending_ack = Some((counter, source));
             }
         }
-    }
-    if let Some((counter, source)) = *pending_ack {
-        let mut ack = alloc::vec![APP_MSG_ACK];
-        ack.extend_from_slice(&counter.to_be_bytes());
-        device.send_unicast(source, ack);
     }
 }
 
@@ -308,7 +281,7 @@ async fn run_mesh(
         info!("mesh base-station running");
         // Advertise immediately so senders learn the route without waiting
         // a full flood interval (10 s) after boot.
-        dw = ogm_flood(
+        dw = send_ogm(
             &device,
             dw,
             hw.clone(),
@@ -343,7 +316,7 @@ async fn run_mesh(
         #[cfg(feature = "base-station")]
         if embassy_time::Instant::now() - last_ogm >= BASE_STATION_OGM_INTERVAL {
             last_ogm = embassy_time::Instant::now();
-            dw = ogm_flood(
+            dw = send_ogm(
                 &device,
                 dw,
                 hw.clone(),
@@ -383,44 +356,18 @@ async fn run_mesh(
                 if *destination == own_address {
                     continue;
                 }
-                let mut acked = false;
-                for _ in 0..MESH_BURST_REPEATS {
+                {
                     wdg.pet();
                     device.send_unicast(*destination, payload_bytes.clone());
                     device.heartbeat();
                     let (d, _) = drain_tx(dw, hw.clone(), short_address, &mut tx_seq).await;
                     dw = d;
-                    acked = sender_ack_received(&device, *destination, ping_counter);
-                    if acked {
-                        break;
-                    }
-                    // Keep listening for the rest of this burst step. The
-                    // base-station only acknowledges while IT is awake, and
-                    // its wake windows are phase-independent of ours — a
-                    // 2 ms poll per step systematically misses every ack
-                    // (phase-lock), so listen continuously instead.
-                    let listen_end = embassy_time::Instant::now() + MESH_BURST_STEP;
-                    while embassy_time::Instant::now() < listen_end {
-                        wdg.pet();
-                        let (d, _) = poll_rx_window_short(dw, hw.clone()).await;
-                        dw = d;
-                        device.heartbeat();
-                        acked = sender_ack_received(&device, *destination, ping_counter);
-                        if acked {
-                            break;
-                        }
-                        let (d, _) = drain_tx(dw, hw.clone(), short_address, &mut tx_seq).await;
-                        dw = d;
-                    }
-                    if acked {
-                        break;
-                    }
                 }
                 info!(
                     "sender: ping #{} -> {} {}",
                     ping_counter,
                     defmt::Debug2Format(&destination),
-                    if acked { "acked" } else { "TIMEOUT" }
+                    "SENT"
                 );
             }
         }
@@ -433,7 +380,7 @@ async fn run_mesh(
 /// phase-locked) node always catches a copy and learns the route to us.
 /// Stays awake (no sleep) for the whole flood; returns the radio back.
 #[cfg(feature = "base-station")]
-async fn ogm_flood(
+async fn send_ogm(
     device: &Device,
     mut dw: DwReady,
     hw: Arc<Mutex<dyn HardwareInterface>>,
@@ -443,16 +390,15 @@ async fn ogm_flood(
     pending_ack: &mut Option<(u32, UwbAddress)>,
 ) -> DwReady {
     info!("base-station: OGM flood starting");
-    for i in 0..MESH_BURST_REPEATS {
+    {
         wdg.pet();
-        device.send_ogm_burst(i, MESH_BURST_REPEATS);
+        device.send_ogm();
         device.heartbeat();
-        app_base_tick(device, pending_ack);
-        let (d, _) = poll_rx_window_short(dw, hw.clone()).await;
-        dw = d;
-        let (d, _) = drain_tx(dw, hw.clone(), short_address, tx_seq).await;
-        dw = d;
-        Timer::after(MESH_BURST_STEP).await;
+        // app_base_tick(device, pending_ack);
+        // let (d, _) = poll_rx_window_short(dw, hw.clone()).await;
+        // dw = d;
+        // let (d, _) = drain_tx(dw, hw.clone(), short_address, tx_seq).await;
+        // dw = d;
     }
     info!("base-station: OGM flood done");
     dw
