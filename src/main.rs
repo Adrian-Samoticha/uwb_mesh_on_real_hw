@@ -16,6 +16,7 @@ use alloc::sync::Arc;
 
 use defmt::*;
 use defmt_rtt as _;
+use dw3000_ng::configs::PreambleLength;
 use dw3000_ng::hl::SendTime;
 use dw3000_ng::time::Instant as DwInstant;
 use dw3000_ng::{self, Config as DwConfig, DW3000, Ready, Sending, SingleBufferReceiving};
@@ -841,11 +842,12 @@ impl embedded_hal_async::delay::DelayNs for AsyncDelay {
 // Frame helpers
 // ---------------------------------------------------------------------------
 
-/// RF config for all TX/RX: default channel 5, PRF 64 MHz, preamble 128,
+/// RF config for all TX/RX: default channel 5, PRF 64 MHz, preamble 512,
 /// 850 kbps, with the ranging bit set.
 fn dw_rf_config() -> DwConfig {
     DwConfig {
         ranging_enable: true,
+        preamble_length: PreambleLength::Symbols512,
         ..Default::default()
     }
 }
