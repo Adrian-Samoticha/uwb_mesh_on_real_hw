@@ -56,11 +56,12 @@ impl Firmware {
         self.mesh.send_ogm();
     }
 
-    /// Queue one copy of a single-OGM flood (one sequence number); the main
-    /// loop calls this once per flood step with the step `index`.
-    pub fn send_ogm_burst(&mut self, index: u32, repeats: u32) {
-        self.mesh.send_ogm_burst(index, repeats);
-    }
+    // TODO: remove this (if it’s unused)
+    // /// Queue one copy of a single-OGM flood (one sequence number); the main
+    // /// loop calls this once per flood step with the step `index`.
+    // pub fn send_ogm_burst(&mut self, index: u32, repeats: u32) {
+    //     self.mesh.send_ogm_burst(index, repeats);
+    // }
 
     /// Queue a unicast frame for `destination`. Used by the real-hardware
     /// main loop (no serial console there).
