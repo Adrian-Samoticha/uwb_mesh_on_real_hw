@@ -1,13 +1,11 @@
 extern crate alloc;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicI32, Ordering};
 use spin::Mutex;
-use std::sync::Weak;
-use std::sync::atomic::{AtomicI32, Ordering};
 
 pub type Id = u64;
 
-use crate::interfaces::hardware_interface_simulator_impl::HardwareInterfaceSimulatorImpl;
-use crate::simulator::SimulatorMutex;
+use crate::interfaces::hardware_interface;
 
 mod array_map;
 mod firmware;
@@ -17,30 +15,33 @@ pub use array_map::ArrayMap;
 
 pub struct Device {
     id: Id,
-    middleware: parking_lot::Mutex<Option<firmware::Firmware>>,
+    middleware: Mutex<Option<firmware::Firmware>>,
     heartbeats_left: AtomicI32,
 }
 
+#[allow(dead_code)]
 impl Device {
     pub fn new(id: Id) -> Self {
         Self {
             id,
-            middleware: parking_lot::Mutex::new(None),
+            middleware: Mutex::new(None),
             heartbeats_left: AtomicI32::new(0),
         }
     }
 
-    pub fn create() -> Arc<Self> {
-        let new_id = crate::id_provider::get_next_id();
-        Arc::new(Self::new(new_id))
+    pub fn create(id: Id) -> Arc<Self> {
+        Arc::new(Self::new(id))
     }
 
-    pub fn init(self: &Arc<Self>, name: &str, model: &str, simulator: Weak<SimulatorMutex>) {
+    pub fn init(
+        self: &Arc<Self>,
+        name: &str,
+        model: &str,
+        hardware_interface: Arc<Mutex<dyn hardware_interface::HardwareInterface>>,
+    ) {
         let mut firmware = firmware::Firmware::new();
 
-        let hardware_interface = HardwareInterfaceSimulatorImpl::new(simulator, self.id as u32);
-
-        firmware.init(name, model, Arc::new(Mutex::new(hardware_interface)));
+        firmware.init(name, model, hardware_interface);
 
         let pending = self.heartbeats_left.swap(0, Ordering::Relaxed);
         for _ in 0..pending {
@@ -58,6 +59,50 @@ impl Device {
         } else {
             self.heartbeats_left.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Queue an OGM flood. No-op until `init` has installed the firmware.
+    pub fn send_ogm(&self) {
+        if let Some(middleware) = self.middleware.lock().as_mut() {
+            middleware.send_ogm();
+        }
+    }
+
+    /// Queue a unicast frame. No-op until `init` has installed the firmware.
+    pub fn send_unicast(
+        &self,
+        destination: hardware_interface::UwbAddress,
+        data: alloc::vec::Vec<u8>,
+    ) {
+        if let Some(middleware) = self.middleware.lock().as_mut() {
+            middleware.send_unicast(destination, data);
+        }
+    }
+
+    /// Drain one addressed-to-me unicast payload (source, data) received by
+    /// the mesh. `None` until such a payload arrives (or `init` hasn't run).
+    pub fn take_received_data(
+        &self,
+    ) -> Option<(hardware_interface::UwbAddress, alloc::vec::Vec<u8>)> {
+        self.middleware
+            .lock()
+            .as_mut()
+            .and_then(|middleware| middleware.take_received_data())
+    }
+
+    /// Snapshot of the mesh routing table (destination -> next hop).
+    /// Empty until `init` has installed the firmware.
+    pub fn get_routing_table(
+        &self,
+    ) -> ArrayMap<hardware_interface::UwbAddress, hardware_interface::UwbAddress, 4> {
+        self.middleware
+            .lock()
+            .as_ref()
+            .map(|middleware| middleware.get_routing_table())
+            .unwrap_or(ArrayMap::new(
+                [None; 4],
+                [hardware_interface::UwbAddress::Short(0); 4],
+            ))
     }
 
     pub fn get_heartbeats_left(&self) -> i32 {
