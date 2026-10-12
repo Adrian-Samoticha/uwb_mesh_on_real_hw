@@ -692,6 +692,19 @@ impl Mesh {
                         sequence_number,
                         data,
                     } => {
+                        let ack_message = Message::Ack {
+                            source: source,
+                            destination: destination,
+                            sequence_number,
+                        }
+                        .to_data();
+                        let outgoing_message = OutgoingMessage {
+                            destination: previous_hop,
+                            data: Rc::new(RefCell::new(ack_message)),
+                            time_to_send_in_ms: 0,
+                        };
+                        self.outgoing_message_handler.add_message(outgoing_message);
+
                         let already_received = self.received_unicast_messages.iter().any(|entry| {
                             entry.source == source
                                 && entry.destination == destination
@@ -764,19 +777,6 @@ impl Mesh {
                                 ));
                             }
                         }
-
-                        let ack_message = Message::Ack {
-                            source: source,
-                            destination: destination,
-                            sequence_number,
-                        }
-                        .to_data();
-                        let outgoing_message = OutgoingMessage {
-                            destination: previous_hop,
-                            data: Rc::new(RefCell::new(ack_message)),
-                            time_to_send_in_ms: 0,
-                        };
-                        self.outgoing_message_handler.add_message(outgoing_message);
                     }
                     Message::Ack {
                         source: _,
