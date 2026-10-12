@@ -717,7 +717,7 @@ impl Mesh {
                                 "Already received unicast message from {} to {} with sequence number {}, ignoring\n",
                                 source, destination, sequence_number
                             ));
-                            break;
+                            continue;
                         }
 
                         self.received_unicast_messages.push(
