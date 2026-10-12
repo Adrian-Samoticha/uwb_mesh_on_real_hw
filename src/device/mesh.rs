@@ -452,7 +452,7 @@ impl Mesh {
 
         let delay_until_next_retry = {
             let mut hi = self.hardware_interface.as_ref().unwrap().lock();
-            let delay = hi.generate_random_integer() % 2 * 10;
+            let delay = (hi.generate_random_integer() % 4 + 2) * 10;
             drop(hi);
             delay
         };
