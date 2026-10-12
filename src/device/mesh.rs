@@ -612,14 +612,6 @@ impl Mesh {
                         source,
                         sequence_number,
                     } => {
-                        {
-                            let hi = self.hardware_interface.as_ref().unwrap().lock();
-                            hi.printf(format_args!(
-                                "Received OGM from {} with sequence number {}\n",
-                                source, sequence_number
-                            ));
-                        }
-
                         let key = UwbAddressAndSequenceNumber {
                             address: source,
                             sequence_number,
@@ -651,6 +643,14 @@ impl Mesh {
                                 source, sequence_number
                             ));
                             continue;
+                        }
+
+                        {
+                            let hi = self.hardware_interface.as_ref().unwrap().lock();
+                            hi.printf(format_args!(
+                                "Received OGM from {} with sequence number {}\n",
+                                source, sequence_number
+                            ));
                         }
 
                         if !self.routing_table.contains_key(&source)
