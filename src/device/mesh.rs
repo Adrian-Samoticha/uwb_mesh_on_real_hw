@@ -11,6 +11,20 @@ use crate::interfaces::hardware_interface::{self, UwbAddress, UwbAddressImpl};
 
 type SharedVec<T> = Rc<RefCell<Vec<T>>>;
 
+// Initially, OGM messages were sent over unicast, rather than broadcast,
+// in order to improve reliability. To this end, the network used probe
+// requests, probe responses, and partner requests to establish reliable unicast
+// paths before sending OGMs. The mesh would work in two phases:
+// 1. Scan the network for other devices using probe requests and responses.
+// 2. Maintain partner relationships and reliable unicast paths with other
+// devices.
+// During testing in the simulator, I have found that this approach could fail
+// if no other devices were found in the first phase. The mesh would then
+// effectively split in two. For this reason, this approach was abandoned in
+// favor of broadcast OGMs. The code that implemented the unicast-based approach
+// was merely commented out rather than deleted, in case it needed to be
+// referenced or reinstated later.
+
 /// Represents a message that can be sent or received in the mesh network.
 enum Message {
     // /// A probe request message, used to discover other devices in the mesh network.
